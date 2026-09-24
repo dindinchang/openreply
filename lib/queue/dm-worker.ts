@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { UnrecoverableError, Worker, type Job } from "bullmq";
+import { Worker, type Job } from "bullmq";
 import {
   getDMQueue,
   getRedisConnection,
@@ -25,14 +24,10 @@ import {
   sendPrivateReply,
   sendPrivateReplyWithButton,
   sendPrivateReplyWithLinkButton,
-} from "@/lib/instagram/provider";
-import {
-  createInstagramContext,
-  hasInstagramCredentials,
-  type InstagramContext,
-} from "@/lib/instagram/provider";
+} from "@/lib/meta/client";
+import { decryptToken } from "@/lib/meta/oauth";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
-import { reserveDMSlot, releaseDMSlot } from "@/lib/utils/rate-limiter";
+import { reserveDMSlot } from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
@@ -43,18 +38,12 @@ import {
   renderMessageWithTracking,
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
-import { TRACKED_LINK_ORDER } from "@/lib/tracking/link-order";
-
-import {
-  ZernioApiError,
-  ZernioDeliveryUnconfirmedError,
-} from "@/lib/zernio/client";
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
-    return `${error.name} ${error.code}: ${error.message}`;
+    return `Meta API Error ${error.code}: ${error.message}`;
   }
   if (error instanceof Error) {
     return error.message;
@@ -74,11 +63,7 @@ const NON_TEMPLATE_REJECTIONS = [
 ];
 
 function isTemplateRejection(error: unknown): boolean {
-  if (
-    error instanceof TokenExpiredError ||
-    error instanceof RateLimitError ||
-    error instanceof ZernioApiError
-  ) {
+  if (error instanceof TokenExpiredError || error instanceof RateLimitError) {
     return false;
   }
   const message = error instanceof Error ? error.message : "";
@@ -100,10 +85,13 @@ function buildLinkButtons(
   trackedLinks: WorkerTrackedLink[],
   primaryLabel: string | null
 ): { title: string; url: string }[] {
+  // Direct destination URLs, not tracked /r/<slug> links: the self-hosted
+  // setup has no public domain of its own (ngrok), so a tracked URL would
+  // surface the ngrok warning page and a foreign-looking address to the
+  // commenter instead of the actual gift link.
   return trackedLinks.slice(0, 3).map((link, index) => ({
-    url: buildTrackedUrl(link.slug),
-    title:
-      (index === 0 ? primaryLabel : link.label) || link.label || "Open link",
+    url: link.destinationUrl,
+    title: (index === 0 ? primaryLabel : link.label) || link.label || "Open link",
   }));
 }
 
@@ -121,9 +109,7 @@ function buildInlineLinkFallback(
   const base =
     renderMessageWithTracking({ message, commenterName, trackedLinks }) ||
     bodyText;
-  const extraUrls = trackedLinks
-    .slice(1)
-    .map((link) => buildTrackedUrl(link.slug));
+  const extraUrls = trackedLinks.slice(1).map((link) => buildTrackedUrl(link.slug));
   return extraUrls.length > 0 ? `${base}\n${extraUrls.join("\n")}` : base;
 }
 
@@ -139,30 +125,24 @@ type RevealAutomation = {
  * button-tap (postback) path and the DM keyword-trigger path — both already
  * have an open conversation with the user, so neither uses a private reply.
  */
-async function sendRevealDirectMessage({
-  accessToken,
-  automation,
-  userId,
-  commenterName,
-  context,
-}: {
-  accessToken: InstagramContext;
-  automation: RevealAutomation;
-  userId: string;
-  commenterName: string | null;
-  context: string;
-}): Promise<void> {
+async function sendRevealDirectMessage(
+  accessToken: string,
+  automation: RevealAutomation,
+  userId: string,
+  commenterName: string | null,
+  context: string
+): Promise<void> {
   if (automation.trackedLinks.length === 0) {
-    await sendDirectMessage({
-      context: accessToken,
-      instagramAccountId: automation.instagramAccount.instagramId,
-      userId: userId,
-      message: renderMessageWithTracking({
+    await sendDirectMessage(
+      accessToken,
+      automation.instagramAccount.instagramId,
+      userId,
+      renderMessageWithTracking({
         message: automation.dmMessage,
         commenterName,
         trackedLinks: automation.trackedLinks,
-      }),
-    });
+      })
+    );
     return;
   }
 
@@ -178,13 +158,13 @@ async function sendRevealDirectMessage({
   );
 
   try {
-    await sendDirectMessageWithLinkButton({
-      context: accessToken,
-      instagramAccountId: automation.instagramAccount.instagramId,
-      userId: userId,
-      text: bodyText,
-      buttons: buttons,
-    });
+    await sendDirectMessageWithLinkButton(
+      accessToken,
+      automation.instagramAccount.instagramId,
+      userId,
+      bodyText,
+      buttons
+    );
   } catch (buttonError) {
     // A closed messaging window rejects the text retry too, so don't let it
     // overwrite the original error with a misleading one.
@@ -195,26 +175,21 @@ async function sendRevealDirectMessage({
       formatError(buttonError)
     );
     try {
-      await sendDirectMessage({
-        context: accessToken,
-        instagramAccountId: automation.instagramAccount.instagramId,
-        userId: userId,
-        message: buildInlineLinkFallback(
+      await sendDirectMessage(
+        accessToken,
+        automation.instagramAccount.instagramId,
+        userId,
+        buildInlineLinkFallback(
           automation.dmMessage,
           commenterName,
           automation.trackedLinks,
           bodyText
-        ),
-      });
+        )
+      );
     } catch {
       throw buttonError;
     }
   }
-}
-
-
-function connectionScope(data: DmQueueJob) {
-  return data.accountConnectionId ? { instagramAccountId: data.accountConnectionId } : {};
 }
 
 async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
@@ -225,22 +200,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     commenterId,
     commenterName,
     mediaId,
-    originalMediaId,
   } = job.data;
   const requeueAttempt = job.data.requeueAttempt ?? 0;
 
   const automations = await prisma.automation.findMany({
     where: {
-      ...connectionScope(job.data),
       // Match campaigns bound to this specific post, plus any-post campaigns.
-      // A comment left on an ad carries the ad's own media id, while the
-      // campaign is bound to the post the ad was created from, so both ids
-      // have to be considered or the comment is dropped without a trace.
-      OR: [
-        { postId: mediaId },
-        ...(originalMediaId ? [{ postId: originalMediaId }] : []),
-        { matchAnyPost: true },
-      ],
+      OR: [{ postId: mediaId }, { matchAnyPost: true }],
       isActive: true,
       instagramAccount: {
         instagramId: instagramAccountId,
@@ -255,13 +221,18 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           label: true,
           destinationUrl: true,
         },
-        orderBy: TRACKED_LINK_ORDER,
+        orderBy: { createdAt: "asc" },
       },
     },
     orderBy: { createdAt: "asc" },
   });
 
-  for (const automation of automations) {
+  // Post-specific campaigns take priority: when one exists for this media,
+  // any-post campaigns are skipped so a comment never gets DMed twice.
+  const postSpecific = automations.filter((a) => a.postId === mediaId);
+  const active = postSpecific.length > 0 ? postSpecific : automations;
+
+  for (const automation of active) {
     // "Any word" campaigns fire on every comment; otherwise require a keyword hit.
     const matchResult = automation.matchAnyWord
       ? { matched: true, matchedKeyword: null }
@@ -286,20 +257,17 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed;
+    const needsDm = !alreadyDmd;
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already sent but whose public reply never posted (e.g. it hit a rate
     // limit) must still come back so the public reply can be retried.
     if (existingLog?.status === "SKIPPED_PLAN_LIMIT") continue;
-    if (
-      !needsDm &&
-      (alreadyPublicReplied || existingLog?.publicReplyDeliveryUnconfirmed || !automation.publicReplyEnabled)
-    ) {
+    if (alreadyDmd && (alreadyPublicReplied || !automation.publicReplyEnabled)) {
       continue;
     }
 
-    if (!hasInstagramCredentials(automation.instagramAccount)) {
+    if (!automation.instagramAccount.accessToken) {
       await prisma.dmLog.upsert({
         where: {
           automationId_commentId: {
@@ -327,12 +295,9 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       continue;
     }
 
-    let accessToken: InstagramContext;
+    let accessToken: string;
     try {
-      accessToken = await createInstagramContext(
-        automation.instagramAccount,
-        `${job.id}:${automation.id}`
-      );
+      accessToken = decryptToken(automation.instagramAccount.accessToken);
     } catch {
       await prisma.dmLog.upsert({
         where: {
@@ -405,8 +370,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     if (
       automation.publicReplyEnabled &&
       replyPool.length > 0 &&
-      !existingLog?.publicReplySentAt &&
-      !existingLog?.publicReplyDeliveryUnconfirmed
+      !existingLog?.publicReplySentAt
     ) {
       try {
         const chosen = replyPool[Math.floor(Math.random() * replyPool.length)];
@@ -415,12 +379,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           trackedLinks: automation.trackedLinks,
         });
-        await sendCommentReply({
-          context: accessToken,
-          commentId: commentId,
-          message: publicReply,
-          postId: mediaId,
-        });
+        await sendCommentReply(accessToken, commentId, publicReply);
         await prisma.dmLog.update({
           where: {
             automationId_commentId: { automationId: automation.id, commentId },
@@ -435,12 +394,9 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         await prisma.dmLog
           .update({
             where: {
-              automationId_commentId: {
-                automationId: automation.id,
-                commentId,
-              },
+              automationId_commentId: { automationId: automation.id, commentId },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
+            data: { publicReplyError: formatError(error) },
           })
           .catch(() => {});
       }
@@ -516,7 +472,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
         },
       });
       throw error;
@@ -590,14 +545,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     // else gets the "follow me first" prompt (re-verified on tap).
     let sendFollowPrompt = false;
     if (automation.requireFollow && !useOpeningDm) {
-      const alreadyFollows = await getUserFollowStatus({
-        context: accessToken,
-        recipientId: commenterId,
-      });
-      sendFollowPrompt =
-        accessToken.provider === "ZERNIO"
-          ? alreadyFollows === false
-          : alreadyFollows !== true;
+      const alreadyFollows = await getUserFollowStatus(accessToken, commenterId);
+      sendFollowPrompt = alreadyFollows !== true;
     }
 
     try {
@@ -607,17 +556,16 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           trackedLinks: [],
         });
-        await sendPrivateReplyWithButton({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          commentId: commentId,
-          text: openingText,
-          buttonTitle: automation.openingDmButtonLabel as string,
-          payload: automation.requireFollow
+        await sendPrivateReplyWithButton(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          commentId,
+          openingText,
+          automation.openingDmButtonLabel as string,
+          automation.requireFollow
             ? `followcheck:${automation.id}`
-            : `reveal:${automation.id}`,
-          postId: mediaId,
-        });
+            : `reveal:${automation.id}`
+        );
       } else if (sendFollowPrompt) {
         const promptText = renderMessageWithoutLink({
           message:
@@ -625,15 +573,14 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             "quick favor before i send your link. i don't make any money from this, it's free. if you want to support me, just don't unfollow after, and star the repo on github if it helps you. tap the button once you're following and i'll send it over",
           commenterName,
         });
-        await sendPrivateReplyWithButton({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          commentId: commentId,
-          text: promptText,
-          buttonTitle: automation.followPromptButtonLabel || "i'm following",
-          payload: `followcheck:${automation.id}`,
-          postId: mediaId,
-        });
+        await sendPrivateReplyWithButton(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          commentId,
+          promptText,
+          automation.followPromptButtonLabel || "i'm following",
+          `followcheck:${automation.id}`
+        );
       } else if (automation.trackedLinks.length > 0) {
         // Try button template first; if Meta rejects it, fall back to inline links.
         const bodyText =
@@ -647,14 +594,13 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         );
 
         try {
-          await sendPrivateReplyWithLinkButton({
-            context: accessToken,
-            instagramAccountId: automation.instagramAccount.instagramId,
-            commentId: commentId,
-            text: bodyText,
-            buttons: buttons,
-            postId: mediaId,
-          });
+          await sendPrivateReplyWithLinkButton(
+            accessToken,
+            automation.instagramAccount.instagramId,
+            commentId,
+            bodyText,
+            buttons
+          );
         } catch (buttonError) {
           // Only a template rejection is worth retrying as text. Anything else
           // (closed window, comment already replied to) fails the same way and
@@ -672,13 +618,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
             bodyText
           );
           try {
-            await sendPrivateReply({
-              context: accessToken,
-              instagramAccountId: automation.instagramAccount.instagramId,
-              commentId: commentId,
-              message: fallbackMessage,
-              postId: mediaId,
-            });
+            await sendPrivateReply(
+              accessToken,
+              automation.instagramAccount.instagramId,
+              commentId,
+              fallbackMessage
+            );
           } catch {
             // The first attempt consumed the comment's single private reply, so
             // this one reports "invalid for a private reply" no matter what the
@@ -692,13 +637,12 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           commenterName,
           trackedLinks: automation.trackedLinks,
         });
-        await sendPrivateReply({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          commentId: commentId,
-          message: dmMessage,
-          postId: mediaId,
-        });
+        await sendPrivateReply(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          commentId,
+          dmMessage
+        );
       }
 
       await prisma.dmLog.update({
@@ -715,12 +659,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         },
       });
     } catch (error) {
-      // The rate slot was reserved before the send; this send did not deliver a
-      // DM, so hand the slot back instead of burning it (and burning more on
-      // each BullMQ retry) until the hourly TTL expires.
-      if (rateLimit?.reserved) {
-        await releaseDMSlot(instagramAccountId);
-      }
       await releaseWorkspaceDMReservation(
         automation.workspaceId,
         usage.periodStart
@@ -737,54 +675,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
         },
       });
       throw error;
     }
-  }
-}
-
-async function sendPostbackOnce({
-  operationId,
-  send,
-}: {
-  operationId: string | null;
-  send: () => Promise<unknown>;
-}): Promise<boolean> {
-  if (!operationId) {
-    await send();
-    return true;
-  }
-  try {
-    await prisma.postbackDelivery.create({ data: { id: operationId } });
-  } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      error.code === "P2002"
-    )
-      return false;
-    throw error;
-  }
-  try {
-    await send();
-    return true;
-  } catch (error) {
-    // A durable claim survives queue eviction, concurrent redelivery, and a
-    // process crash during delivery. Only confirmed rejections permit retry.
-    if (
-      (error instanceof ZernioApiError && error.code < 500) ||
-      error instanceof RateLimitError ||
-      error instanceof TokenExpiredError
-    ) {
-      await prisma.postbackDelivery.delete({ where: { id: operationId } });
-      throw error;
-    }
-    throw error instanceof ZernioDeliveryUnconfirmedError
-      ? error
-      : new ZernioDeliveryUnconfirmedError();
   }
 }
 
@@ -799,17 +693,17 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   const isFollowCheck = payload.startsWith("followcheck:");
   if (!isFollowCheck && !payload.startsWith("reveal:")) return;
   const automationId = payload.slice(
-    isFollowCheck ? "followcheck:".length : "reveal:".length,
+    isFollowCheck ? "followcheck:".length : "reveal:".length
   );
 
   const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true, ...connectionScope(job.data) },
+    where: { id: automationId, isActive: true },
     include: {
       instagramAccount: true,
       workspace: true,
       trackedLinks: {
         select: { slug: true, label: true, destinationUrl: true },
-        orderBy: TRACKED_LINK_ORDER,
+        orderBy: { createdAt: "asc" },
       },
     },
   });
@@ -817,7 +711,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   if (
     !automation ||
     automation.instagramAccount.instagramId !== instagramAccountId ||
-    !hasInstagramCredentials(automation.instagramAccount)
+    !automation.instagramAccount.accessToken
   ) {
     return;
   }
@@ -835,11 +729,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         },
       },
     });
-    if (
-      existingReveal?.status === "SENT" ||
-      existingReveal?.dmDeliveryUnconfirmed
-    )
-      return;
+    if (existingReveal?.status === "SENT") return;
   }
 
   // Personalize {username} from the opening DM log for this user, if present.
@@ -849,29 +739,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   });
   const commenterName = openingLog?.commenterName ?? null;
 
-  let accessToken: InstagramContext;
+  let accessToken: string;
   try {
-    accessToken = await createInstagramContext(
-      automation.instagramAccount,
-      `${job.id}:${automation.id}`,
-    );
+    accessToken = decryptToken(automation.instagramAccount.accessToken);
   } catch {
     return;
   }
-
-  const operationId =
-    accessToken.provider === "ZERNIO"
-      ? createHash("sha256")
-          .update(
-            JSON.stringify([
-              automation.instagramAccountId,
-              automation.id,
-              userId,
-              job.data.mid ?? job.id ?? payload,
-            ]),
-          )
-          .digest("hex")
-      : null;
 
   // Follow-gate: before revealing the link, verify the user follows. On a
   // `followcheck:` tap a non-follower gets the prompt again (no quota spent);
@@ -880,10 +753,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // unverifiable (null), falls through and delivers the link — fail-open so a
   // real follower is never trapped.
   if ((isFollowCheck || fallback) && automation.requireFollow) {
-    const follows = await getUserFollowStatus({
-      context: accessToken,
-      recipientId: userId,
-    });
+    const follows = await getUserFollowStatus(accessToken, userId);
     if (follows === false) {
       if (fallback) return;
       const promptText = renderMessageWithoutLink({
@@ -893,23 +763,18 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commenterName,
       });
       try {
-        await sendPostbackOnce({
-          operationId,
-          send: () =>
-            sendDirectMessageWithButton({
-              context: accessToken,
-              instagramAccountId: automation.instagramAccount.instagramId,
-              userId: userId,
-              text: promptText,
-              buttonTitle:
-                automation.followPromptButtonLabel || "i'm following",
-              payload: `followcheck:${automation.id}`,
-            }),
-        });
+        await sendDirectMessageWithButton(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          userId,
+          promptText,
+          automation.followPromptButtonLabel || "i'm following",
+          `followcheck:${automation.id}`
+        );
       } catch (error) {
         console.log(
           "[DM Worker] Failed to re-send follow prompt:",
-          formatError(error),
+          formatError(error)
         );
       }
       return;
@@ -920,10 +785,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   if (!usage.allowed) {
     await prisma.dmLog.upsert({
       where: {
-        automationId_commentId: {
-          automationId: automation.id,
-          commentId: dedupeId,
-        },
+        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
       },
       create: {
         workspaceId: automation.workspaceId,
@@ -942,24 +804,13 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   }
 
   try {
-    const delivered = await sendPostbackOnce({
-      operationId,
-      send: () =>
-        sendRevealDirectMessage({
-          accessToken: accessToken,
-          automation: automation,
-          userId: userId,
-          commenterName: commenterName,
-          context: "postback",
-        }),
-    });
-    if (!delivered) {
-      await releaseWorkspaceDMReservation(
-        automation.workspaceId,
-        usage.periodStart,
-      );
-      return;
-    }
+    await sendRevealDirectMessage(
+      accessToken,
+      automation,
+      userId,
+      commenterName,
+      "postback"
+    );
     // Optional appreciation follow-up: once the link has been delivered, send a
     // short thank-you. It is scheduled as its own delayed job so it can go out
     // some minutes later (followUpDelayMinutes) rather than immediately. The
@@ -971,7 +822,6 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         FOLLOWUP_JOB_NAME,
         {
           instagramAccountId: automation.instagramAccount.instagramId,
-          accountConnectionId: automation.instagramAccountId,
           userId,
           automationId: automation.id,
           commenterName,
@@ -979,15 +829,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         {
           delay: delayMs,
           jobId: `followup_${automation.id}_${userId}`,
-        },
+        }
       );
     }
     await prisma.dmLog.upsert({
       where: {
-        automationId_commentId: {
-          automationId: automation.id,
-          commentId: dedupeId,
-        },
+        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
       },
       create: {
         workspaceId: automation.workspaceId,
@@ -1003,10 +850,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
     });
   } catch (error) {
-    await releaseWorkspaceDMReservation(
-      automation.workspaceId,
-      usage.periodStart,
-    );
+    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
 
     // The read fallback is speculative: it only runs when the user read the
     // opening DM and never tapped the button, which means they never messaged
@@ -1015,20 +859,17 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // failure the user can act on — so don't log it as FAILED and don't retry
     // it against a window that cannot reopen on its own. It still delivers in
     // the case that does work: the user replied by typing instead of tapping.
-    if (fallback && !(error instanceof ZernioDeliveryUnconfirmedError)) {
+    if (fallback) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
-        formatError(error),
+        formatError(error)
       );
       return;
     }
 
     await prisma.dmLog.upsert({
       where: {
-        automationId_commentId: {
-          automationId: automation.id,
-          commentId: dedupeId,
-        },
+        automationId_commentId: { automationId: automation.id, commentId: dedupeId },
       },
       create: {
         workspaceId: automation.workspaceId,
@@ -1040,13 +881,8 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentId: dedupeId,
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
       },
-      update: {
-        status: "FAILED",
-        errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
-      },
+      update: { status: "FAILED", errorMessage: formatError(error) },
     });
     throw error;
   }
@@ -1061,7 +897,7 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
   const { instagramAccountId, userId, automationId, commenterName } = job.data;
 
   const automation = await prisma.automation.findFirst({
-    where: { id: automationId, isActive: true, ...connectionScope(job.data) },
+    where: { id: automationId, isActive: true },
     include: { instagramAccount: true },
   });
 
@@ -1070,31 +906,28 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
     !automation.followUpEnabled ||
     !automation.followUpMessage?.trim() ||
     automation.instagramAccount.instagramId !== instagramAccountId ||
-    !hasInstagramCredentials(automation.instagramAccount)
+    !automation.instagramAccount.accessToken
   ) {
     return;
   }
 
-  let accessToken: InstagramContext;
+  let accessToken: string;
   try {
-    accessToken = await createInstagramContext(
-      automation.instagramAccount,
-      `${job.id}:${automation.id}`
-    );
+    accessToken = decryptToken(automation.instagramAccount.accessToken);
   } catch {
     return;
   }
 
   try {
-    await sendDirectMessage({
-      context: accessToken,
-      instagramAccountId: automation.instagramAccount.instagramId,
-      userId: userId,
-      message: renderMessageWithoutLink({
+    await sendDirectMessage(
+      accessToken,
+      automation.instagramAccount.instagramId,
+      userId,
+      renderMessageWithoutLink({
         message: automation.followUpMessage,
         commenterName: commenterName ?? null,
-      }),
-    });
+      })
+    );
   } catch (error) {
     console.log(
       "[DM Worker] Failed to send follow-up message:",
@@ -1116,7 +949,6 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
 
   const automations = await prisma.automation.findMany({
     where: {
-      ...connectionScope(job.data),
       dmTriggerEnabled: true,
       isActive: true,
       instagramAccount: { instagramId: instagramAccountId },
@@ -1126,7 +958,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       workspace: true,
       trackedLinks: {
         select: { slug: true, label: true, destinationUrl: true },
-        orderBy: TRACKED_LINK_ORDER,
+        orderBy: { createdAt: "asc" },
       },
     },
     orderBy: { createdAt: "asc" },
@@ -1158,8 +990,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     // of the job must not send a second DM.
     if (
       existingLog?.status === "SENT" ||
-      existingLog?.status === "SKIPPED_PLAN_LIMIT" ||
-      existingLog?.dmDeliveryUnconfirmed
+      existingLog?.status === "SKIPPED_PLAN_LIMIT"
     ) {
       continue;
     }
@@ -1174,7 +1005,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       matchedKeyword: matchResult.matchedKeyword,
     };
 
-    if (!hasInstagramCredentials(automation.instagramAccount)) {
+    if (!automation.instagramAccount.accessToken) {
       await prisma.dmLog.upsert({
         where: {
           automationId_commentId: {
@@ -1195,12 +1026,9 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
       continue;
     }
 
-    let accessToken: InstagramContext;
+    let accessToken: string;
     try {
-      accessToken = await createInstagramContext(
-        automation.instagramAccount,
-        `${job.id}:${automation.id}`
-      );
+      accessToken = decryptToken(automation.instagramAccount.accessToken);
     } catch {
       await prisma.dmLog.upsert({
         where: {
@@ -1239,14 +1067,8 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
     // anyone whose status the API happens not to resolve.
     let sendFollowPrompt = false;
     if (automation.requireFollow) {
-      const follows = await getUserFollowStatus({
-        context: accessToken,
-        recipientId: senderId,
-      });
-      sendFollowPrompt =
-        accessToken.provider === "ZERNIO"
-          ? follows === false
-          : follows !== true;
+      const follows = await getUserFollowStatus(accessToken, senderId);
+      sendFollowPrompt = follows !== true;
     }
 
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
@@ -1279,22 +1101,22 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
             "Almost there! Follow me and tap the button below to grab your link 💛",
           commenterName,
         });
-        await sendDirectMessageWithButton({
-          context: accessToken,
-          instagramAccountId: automation.instagramAccount.instagramId,
-          userId: senderId,
-          text: promptText,
-          buttonTitle: automation.followPromptButtonLabel || "I'm following ✅",
-          payload: `followcheck:${automation.id}`,
-        });
+        await sendDirectMessageWithButton(
+          accessToken,
+          automation.instagramAccount.instagramId,
+          senderId,
+          promptText,
+          automation.followPromptButtonLabel || "I'm following ✅",
+          `followcheck:${automation.id}`
+        );
       } else {
-        await sendRevealDirectMessage({
-          accessToken: accessToken,
-          automation: automation,
-          userId: senderId,
-          commenterName: commenterName,
-          context: "message trigger",
-        });
+        await sendRevealDirectMessage(
+          accessToken,
+          automation,
+          senderId,
+          commenterName,
+          "message trigger"
+        );
 
         // The link has been delivered, so the appreciation follow-up applies
         // here exactly as it does after a button tap. Not scheduled behind the
@@ -1304,7 +1126,6 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
             FOLLOWUP_JOB_NAME,
             {
               instagramAccountId: automation.instagramAccount.instagramId,
-              accountConnectionId: automation.instagramAccountId,
               userId: senderId,
               automationId: automation.id,
               commenterName,
@@ -1354,13 +1175,11 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
         },
         update: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
         },
       });
       throw error;
@@ -1368,7 +1187,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   }
 }
 
-async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
+async function processJob(job: Job<DmQueueJob>): Promise<void> {
   if (job.name === POSTBACK_JOB_NAME) {
     return processPostback(job as Job<ProcessPostbackJob>);
   }
@@ -1379,16 +1198,6 @@ async function dispatchJob(job: Job<DmQueueJob>): Promise<void> {
     return processMessage(job as Job<ProcessMessageJob>);
   }
   return processComment(job as Job<ProcessCommentJob>);
-}
-
-async function processJob(job: Job<DmQueueJob>): Promise<void> {
-  try {
-    await dispatchJob(job);
-  } catch (error) {
-    if (error instanceof ZernioDeliveryUnconfirmedError)
-      throw new UnrecoverableError(error.message);
-    throw error;
-  }
 }
 
 async function recordWorkerFailure(
@@ -1436,15 +1245,286 @@ async function recordWorkerFailure(
   }
 }
 
-export function createDMWorker(): Worker<DmQueueJob> {
-  const worker = new Worker<DmQueueJob>("dm-processing", processJob, {
-    connection: getRedisConnection(),
-    concurrency: 5,
-    settings: {
-      backoffStrategy: (attemptsMade: number) =>
-        BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
+/**
+ * Polling path for follow-gated reveals — the $0 replacement for the postback
+ * webhook (which needs Advanced Access / App Review we don't have).
+ *
+ * Every sweep: find opening DMs already sent (dmLog SENT) on active,
+ * follow-gated campaigns where the reveal has not been delivered yet, check the
+ * commenter's follow status via `is_user_follow_business`, and deliver the
+ * reveal DM once they now follow. Uses the exact same dedupe id
+ * (`reveal:<commenterId>`) as the postback path, so a button tap and this poll
+ * can never double-send. Unlike the postback path (fail-open), this one is
+ * fail-closed: only a confirmed follow (`true`) triggers the reveal.
+ */
+export async function reconcileFollowReveals(): Promise<void> {
+  const automations = await prisma.automation.findMany({
+    where: { isActive: true, openingDmEnabled: true, requireFollow: true },
+    include: {
+      instagramAccount: true,
+      trackedLinks: {
+        select: { slug: true, label: true, destinationUrl: true },
+        orderBy: { createdAt: "asc" },
+      },
     },
   });
+  if (automations.length === 0) return;
+
+  const sentOpening = await prisma.dmLog.findMany({
+    where: {
+      status: "SENT",
+      automationId: { in: automations.map((a) => a.id) },
+    },
+    select: {
+      automationId: true,
+      commenterId: true,
+      commenterName: true,
+      commentId: true,
+    },
+    take: 100,
+  });
+
+  // Group opening-DM recipients per automation (skip bookkeeping rows like the
+  // postback path's own `reveal:<userId>` entries, which have no comment).
+  const pending = new Map<
+    string,
+    Map<string, { name: string | null; revealed: boolean }>
+  >();
+  for (const log of sentOpening) {
+    if (log.commentId.startsWith("reveal:")) continue;
+    let users = pending.get(log.automationId);
+    if (!users) {
+      users = new Map();
+      pending.set(log.automationId, users);
+    }
+    if (!users.has(log.commenterId)) {
+      users.set(log.commenterId, { name: log.commenterName, revealed: false });
+    }
+  }
+
+  const tokenCache = new Map<string, string | null>();
+
+  for (const automation of automations) {
+    const users = pending.get(automation.id);
+    if (!users || users.size === 0) continue;
+
+    const account = automation.instagramAccount;
+    let accessToken = tokenCache.get(account.id);
+    if (accessToken === undefined) {
+      try {
+        accessToken = account.accessToken
+          ? decryptToken(account.accessToken)
+          : null;
+      } catch {
+        accessToken = null;
+      }
+      tokenCache.set(account.id, accessToken);
+    }
+    if (!accessToken) continue;
+
+    for (const [commenterId, entry] of users) {
+      // Same dedupe id as the postback path; only a SENT reveal stops us.
+      const dedupeId = `reveal:${commenterId}`;
+      const existing = await prisma.dmLog.findUnique({
+        where: {
+          automationId_commentId: {
+            automationId: automation.id,
+            commentId: dedupeId,
+          },
+        },
+        select: { status: true },
+      });
+
+      const follows = await getUserFollowStatus(accessToken, commenterId);
+      if (follows === false) {
+        // Not following (anymore): remind them — regardless of whether the
+        // reveal was already delivered, so a follower who unfollowed still
+        // gets the nudge instead of being silently dropped. Throttled so a
+        // long-term non-follower gets at most one reminder per window instead
+        // of one per 10s sweep. The button's own postback path is unreachable
+        // without Advanced Access, so the poll is the only way to deliver this.
+        const throttleMs =
+          Number(process.env.FOLLOW_PROMPT_THROTTLE_HOURS ?? 24) *
+          60 *
+          60 *
+          1000;
+        const promptId = `follow-prompt:${commenterId}`;
+        const promptLog = await prisma.dmLog.findUnique({
+          where: {
+            automationId_commentId: {
+              automationId: automation.id,
+              commentId: promptId,
+            },
+          },
+          select: { status: true, createdAt: true },
+        });
+        const withinThrottle =
+          promptLog &&
+          promptLog.createdAt.getTime() > Date.now() - throttleMs;
+        if (withinThrottle) continue;
+
+        const promptText =
+          automation.followPromptMessage ||
+          "您尚未追蹤，所以無法領取禮物。追蹤後我會自動送上 🎁";
+        const promptUsage = await reserveWorkspaceDMSend(
+          automation.workspaceId
+        );
+        if (!promptUsage.allowed) continue;
+        try {
+          await sendDirectMessage(
+            accessToken,
+            account.instagramId,
+            commenterId,
+            promptText
+          );
+          await prisma.dmLog.upsert({
+            where: {
+              automationId_commentId: {
+                automationId: automation.id,
+                commentId: promptId,
+              },
+            },
+            create: {
+              workspaceId: automation.workspaceId,
+              automationId: automation.id,
+              instagramAccountId: account.id,
+              commenterId,
+              commenterName: entry.name,
+              commentText: "(follow prompt via poll)",
+              commentId: promptId,
+              status: "SENT",
+              dmSentAt: new Date(),
+            },
+            update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
+          });
+          console.log(
+            `[DM Worker] Follow prompt sent via poll to ${commenterId} (${automation.name})`
+          );
+        } catch (error) {
+          await releaseWorkspaceDMReservation(
+            automation.workspaceId,
+            promptUsage.periodStart
+          );
+          // 失敗也寫 follow-prompt 記錄（status FAILED），讓節流檢查
+          // （只看 createdAt）生效——否則每 10 秒 sweep 都會重試同一個
+          // 無法送出的提示，無限轟炸 Meta API、吃光 rate limit
+          // （2026-08-26 實測：20583+ 次重試 → sweep 被限流 → 系統停擺）。
+          const errText = formatError(error);
+          await prisma.dmLog.upsert({
+            where: {
+              automationId_commentId: {
+                automationId: automation.id,
+                commentId: promptId,
+              },
+            },
+            create: {
+              workspaceId: automation.workspaceId,
+              automationId: automation.id,
+              instagramAccountId: account.id,
+              commenterId,
+              commenterName: entry.name,
+              commentText: "(follow prompt via poll)",
+              commentId: promptId,
+              status: "FAILED",
+              errorMessage: errText,
+            },
+            update: { status: "FAILED", errorMessage: errText, createdAt: new Date() },
+          });
+          console.log(
+            `[DM Worker] Follow prompt failed for ${commenterId}:`,
+            errText
+          );
+        }
+        continue;
+      }
+      if (follows !== true) continue; // unverifiable: wait for a definite state
+
+      // Confirmed follower: deliver the reveal, once.
+      if (existing?.status === "SENT") continue;
+
+      const usage = await reserveWorkspaceDMSend(automation.workspaceId);
+      if (!usage.allowed) {
+        await prisma.dmLog.upsert({
+          where: {
+            automationId_commentId: {
+              automationId: automation.id,
+              commentId: dedupeId,
+            },
+          },
+          create: {
+            workspaceId: automation.workspaceId,
+            automationId: automation.id,
+            instagramAccountId: account.id,
+            commenterId,
+            commenterName: entry.name,
+            commentText: "(follow verified via poll)",
+            commentId: dedupeId,
+            status: "SKIPPED_PLAN_LIMIT",
+            errorMessage: `Monthly DM limit reached (${usage.limit})`,
+          },
+          update: { status: "SKIPPED_PLAN_LIMIT" },
+        });
+        continue;
+      }
+
+      try {
+        await sendRevealDirectMessage(
+          accessToken,
+          automation,
+          commenterId,
+          entry.name,
+          "follow-poll"
+        );
+        await prisma.dmLog.upsert({
+          where: {
+            automationId_commentId: {
+              automationId: automation.id,
+              commentId: dedupeId,
+            },
+          },
+          create: {
+            workspaceId: automation.workspaceId,
+            automationId: automation.id,
+            instagramAccountId: account.id,
+            commenterId,
+            commenterName: entry.name,
+            commentText: "(follow verified via poll)",
+            commentId: dedupeId,
+            status: "SENT",
+            dmSentAt: new Date(),
+          },
+          update: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
+        });
+        console.log(
+          `[DM Worker] Follow reveal sent via poll to ${commenterId} (${automation.name})`
+        );
+      } catch (error) {
+        await releaseWorkspaceDMReservation(
+          automation.workspaceId,
+          usage.periodStart
+        );
+        console.log(
+          `[DM Worker] Follow reveal failed for ${commenterId}:`,
+          formatError(error)
+        );
+      }
+    }
+  }
+}
+
+export function createDMWorker(): Worker<DmQueueJob> {
+  const worker = new Worker<DmQueueJob>(
+    "dm-processing",
+    processJob,
+    {
+      connection: getRedisConnection(),
+      concurrency: 5,
+      settings: {
+        backoffStrategy: (attemptsMade: number) =>
+          BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
+      },
+    }
+  );
 
   worker.on("completed", (job) => {
     console.log(`[DM Worker] Job ${job.id} completed`);
@@ -1479,3 +1559,4 @@ export function createDMWorker(): Worker<DmQueueJob> {
 
   return worker;
 }
+

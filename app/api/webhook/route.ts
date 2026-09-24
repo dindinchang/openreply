@@ -8,6 +8,7 @@ import { processInstagramWebhook } from "@/lib/queue/process-webhook";
 
 
 export async function GET(request: NextRequest) {
+  console.log("[WEBHOOK] GET received:", request.url.slice(0, 150));
   const searchParams = request.nextUrl.searchParams;
   const mode = searchParams.get("hub.mode");
   const token = searchParams.get("hub.verify_token");
@@ -26,6 +27,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const rawBody = await request.text();
   const signature = request.headers.get("x-hub-signature-256");
+  console.log("[WEBHOOK] POST received. sig:", signature ? signature.slice(0, 20) + "..." : "NONE", "| body:", rawBody.slice(0, 150));
 
   if (!verifyWebhookSignature(rawBody, signature)) {
     // Record the attempt so a signature mismatch is visible rather than a

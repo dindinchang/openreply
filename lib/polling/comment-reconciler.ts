@@ -32,11 +32,8 @@ import {
   getUserMedia,
   MetaApiError,
   type InstagramComment,
-} from "@/lib/instagram/provider";
-import {
-  createInstagramContext,
-  type InstagramContext,
-} from "@/lib/instagram/provider";
+} from "@/lib/meta/client";
+import { decryptToken } from "@/lib/meta/oauth";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 
 // Only consider comments from the last few days — older ones are outside
@@ -46,7 +43,11 @@ const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
 // a viral post drains gradually instead of bursting into the comment API.
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
 // For "any post" campaigns, how many recent posts to scan.
-const RECENT_MEDIA_LIMIT = 10;
+// 2026-08-26: 10 → 25。原本只掃最近 10 篇，3/31 的舊 reel 被留言（8/26
+// 實測 @notsoyooung）完全掃不到 → 開場 DM 漏送。25 涵蓋全部貼文（3/26 至今）。
+// 代價是每次 sweep 多打 comments API；配 .env COMMENT_POLL_INTERVAL_MS=60000
+// 控制頻率（見 worker/dm-worker.ts 與 .env）。
+const RECENT_MEDIA_LIMIT = 25;
 
 interface SweepStat {
   campaign: string;
@@ -58,8 +59,7 @@ interface SweepStat {
 }
 
 function errMessage(error: unknown): string {
-  if (error instanceof MetaApiError)
-    return `Meta ${error.code}: ${error.message}`;
+  if (error instanceof MetaApiError) return `Meta ${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
   return "Unknown error";
 }
@@ -84,23 +84,16 @@ export async function reconcileComments(): Promise<void> {
           instagramId: true,
           username: true,
           accessToken: true,
-          provider: true,
-          workspaceId: true,
-          zernioAccountId: true,
         },
       },
     },
   });
 
   const sinceMs = Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000;
-  const tokenCache = new Map<string, InstagramContext | null>();
+  const tokenCache = new Map<string, string | null>();
 
   for (const automation of automations) {
-    const stat = await sweepCampaign({
-      automation: automation,
-      sinceMs: sinceMs,
-      tokenCache: tokenCache,
-    }).catch(
+    const stat = await sweepCampaign(automation, sinceMs, tokenCache).catch(
       (error): SweepStat => ({
         campaign: automation.name,
         keywords: automation.keywords.join(","),
@@ -114,11 +107,7 @@ export async function reconcileComments(): Promise<void> {
   }
 }
 
-async function sweepCampaign({
-  automation,
-  sinceMs,
-  tokenCache,
-}: {
+async function sweepCampaign(
   automation: {
     id: string;
     name: string;
@@ -133,14 +122,11 @@ async function sweepCampaign({
       instagramId: string;
       username: string;
       accessToken: string;
-      provider: "META" | "ZERNIO";
-      workspaceId: string;
-      zernioAccountId: string | null;
     };
-  };
-  sinceMs: number;
-  tokenCache: Map<string, InstagramContext | null>;
-}): Promise<SweepStat> {
+  },
+  sinceMs: number,
+  tokenCache: Map<string, string | null>
+): Promise<SweepStat> {
   const account = automation.instagramAccount;
   const stat: SweepStat = {
     campaign: automation.name,
@@ -157,7 +143,7 @@ async function sweepCampaign({
   let accessToken = tokenCache.get(account.id);
   if (accessToken === undefined) {
     try {
-      accessToken = await createInstagramContext(account);
+      accessToken = decryptToken(account.accessToken);
     } catch {
       accessToken = null;
     }
@@ -173,13 +159,9 @@ async function sweepCampaign({
   const mediaIds: string[] = [];
   if (automation.postId) {
     mediaIds.push(automation.postId);
-    mediaIds.push(...(await adMediaFor(automation.postId)));
   } else if (automation.matchAnyPost) {
     try {
-      const media = await getUserMedia({
-        context: accessToken,
-        limit: RECENT_MEDIA_LIMIT,
-      });
+      const media = await getUserMedia(accessToken, RECENT_MEDIA_LIMIT);
       mediaIds.push(...media.map((m) => m.id));
     } catch (error) {
       stat.errors.push(`Media list: ${errMessage(error)}`);
@@ -192,11 +174,7 @@ async function sweepCampaign({
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
     try {
-      comments = await getRecentMediaComments({
-        context: accessToken,
-        mediaId: mediaId,
-        sinceMs: sinceMs,
-      });
+      comments = await getRecentMediaComments(accessToken, mediaId, sinceMs);
     } catch (error) {
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
       continue;
@@ -205,16 +183,16 @@ async function sweepCampaign({
     // Keep only comments that (a) aren't the account's own, (b) match the
     // keyword, and (c) have no reply from the account owner yet.
     const needsAction = comments.filter((c) => {
+      // Explicit lookback guard: never act on comments outside the recent
+      // window even if the API returned them.
+      if (c.timestamp && Date.parse(c.timestamp) < sinceMs) return false;
       const authorId = c.from?.id;
       if (!authorId || authorId === account.instagramId) return false;
 
       const matched = automation.matchAnyWord
         ? true
-        : matchKeywords(
-            c.text ?? "",
-            automation.keywords,
-            automation.wholeWordMatch
-          ).matched;
+        : matchKeywords(c.text ?? "", automation.keywords, automation.wholeWordMatch)
+            .matched;
       if (!matched) return false;
       stat.matched += 1;
 
@@ -229,28 +207,33 @@ async function sweepCampaign({
     });
     if (needsAction.length === 0) continue;
 
-    // Second guard against races: skip comments this campaign has already fully
-    // handled. "Fully handled" depends on the campaign: if it posts a public
-    // reply, the completion signal is publicReplySentAt (a DM alone is not
-    // enough — the reply still has to land); otherwise a SENT DM is enough. This
-    // is what lets a comment whose DM sent but whose public reply failed come
-    // back and retry the reply.
+    // Skip comments this campaign has already queued before — regardless of
+    // outcome. A comment that failed is retried by the job's own backoff
+    // (5/15/45 min), never re-enqueued by the next sweep: re-enqueueing on
+    // every 10s sweep is what turned a single failing comment into an endless
+    // retry storm against the Meta API (code 1 / "unknown error" spam).
     const handled = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
         commentId: { in: needsAction.map((c) => c.id) },
-        AND: [
-          { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
-          ...(automation.publicReplyEnabled ? [{ OR: [{ publicReplySentAt: { not: null } }, { publicReplyDeliveryUnconfirmed: true }] }] : []),
-        ],
       },
       select: { commentId: true },
     });
     const handledSet = new Set(handled.map((h) => h.commentId));
 
+    // Global dedup across campaigns: a comment is processed once, ever. The
+    // ProcessedComment table is the shared webhook+polling dedup set; without
+    // it, a comment matching several active campaigns gets re-enqueued by each
+    // campaign's sweep (and re-sent by the worker) every cycle.
+    const processed = await prisma.processedComment.findMany({
+      where: { commentId: { in: needsAction.map((c) => c.id) } },
+      select: { commentId: true },
+    });
+    const processedSet = new Set(processed.map((p) => p.commentId));
+
     // Oldest first, so whoever commented earliest gets answered first, capped.
     const fresh = needsAction
-      .filter((c) => !handledSet.has(c.id))
+      .filter((c) => !handledSet.has(c.id) && !processedSet.has(c.id))
       .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))
       .slice(0, MAX_NEW_PER_SWEEP);
 
@@ -262,62 +245,28 @@ async function sweepCampaign({
       // (publicReplySentAt / SENT), so re-processing a comment is safe.
       await queue.add("process-comment", {
         instagramAccountId: account.instagramId,
-        accountConnectionId: account.id,
         commentId: c.id,
         commentText: c.text ?? "",
         commenterId: c.from!.id,
         commenterName: c.from?.username,
         mediaId,
-        // When the sweep is looking at an ad, the campaign is bound to the post
-        // the ad was made from: without this the worker matches nothing and
-        // drops the comment, so the sweep would enqueue it again every five
-        // minutes and never deliver it.
-        originalMediaId:
-          automation.postId && mediaId !== automation.postId
-            ? automation.postId
-            : undefined,
         source: "POLLING",
       });
+      // Mark globally processed so no other campaign (or sweep) re-queues it.
+      await prisma.processedComment
+        .create({
+          data: {
+            instagramAccountId: account.instagramId,
+            commentId: c.id,
+            source: "POLLING",
+          },
+        })
+        .catch(() => {});
       stat.enqueued += 1;
     }
   }
 
   return stat;
-}
-
-/**
- * Ad copies of a post, as seen in webhooks already received.
- *
- * Boosting a post gives it a second media id: comments left on the ad arrive
- * with the ad's `media.id` and the post's id in `original_media_id`. The sweep
- * would otherwise only ever look at the post itself, so a comment Meta fails to
- * deliver on the ad is lost for good — exactly the case this safety net exists
- * for, and the one where volume is highest.
- *
- * The ad ids are recovered from the webhooks themselves rather than from the
- * ads API, which would need ads_management on top of the permissions the app
- * already asks for. The trade-off: an ad becomes visible to the sweep only once
- * a single comment on it has arrived. That is enough for the failure being
- * covered here, where some webhooks arrive and others do not.
- */
-export async function adMediaFor(postId: string): Promise<string[]> {
-  try {
-    const rows = await prisma.$queryRaw<{ mediaId: string | null }[]>`
-      SELECT DISTINCT change->'value'->'media'->>'id' AS "mediaId"
-      FROM "WebhookEvent" w,
-           jsonb_array_elements(w.payload::jsonb->'entry') entry,
-           jsonb_array_elements(entry->'changes') change
-      WHERE change->>'field' = 'comments'
-        AND change->'value'->'media'->>'original_media_id' = ${postId}
-        AND w."createdAt" > now() - interval '90 days'
-    `;
-    return rows
-      .map((r) => r.mediaId)
-      .filter((id): id is string => Boolean(id) && id !== postId);
-  } catch {
-    // A failure here must not stop the sweep: the post itself is still checked.
-    return [];
-  }
 }
 
 async function recordSweep(
