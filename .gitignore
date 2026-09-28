@@ -43,3 +43,15 @@ next-env.d.ts
 
 /app/generated/prisma
 .gstack/
+
+# local runtime debris - never push to cloud
+/logs/
+/_archive/
+/query/
+/check_data.js
+/create-boot-task.bat
+/openreply-start.bat
+/scripts/watchdog-launch.vbs
+/watchdog-junction.bat
+/watchdog-task.bat
+/watchdog.bat
